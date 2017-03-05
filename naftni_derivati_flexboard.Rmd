@@ -1,0 +1,126 @@
+---
+title: "Pregledovalnik cen naftnih derivatov"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    social: menu
+    source_code: embed
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(ggplot2)
+library(tidyr)
+# webscrape
+library(rvest)
+library(DBI)
+library(RSQLite)
+```
+
+```{r prepare_data, results = "hide"}
+# najprej si shranimo html
+xyurl <- read_html(x = "http://www.mgrt.gov.si/si/delovna_podrocja/notranji_trg/nadzor_cen_naftnih_derivatov/cene_naftnih_derivatov/")
+
+# tale stran http://blog.corynissen.com/2015/01/using-rvest-to-scrape-html-table.html
+# razloži kako najdeš tabelo z Xpathom v vsej tej žungli
+xy <- xyurl %>% 
+  html_nodes(xpath = '//*[@id="c17268"]/table[3]') %>%
+  html_table()
+
+
+xy <- xy[[1]][-1, ] # ker je grda tabela, je treba prvo vrstico zabrisat stran
+# prva vrstica so še vedno imena, kar izkoristimo v nadaljevanju
+names(xy) <- xy[1, ]
+xy <- xy[-1, ]
+
+# lepša in izvirnejša imena
+names(xy) <- c("datum", "noPb95", "dizl", "kaodizl")
+
+# vejice zamenjamo za pike, da bo R lahko coercal v številke
+xy$noPb95 <- as.numeric(gsub(",", ".", xy$noPb95))
+xy$dizl <- as.numeric(gsub(",", ".", xy$dizl))
+xy$kaodizl <- as.numeric(gsub(",", ".", xy$kaodizl))
+
+# ok, zdej mamo podatke
+# summary(xy)
+
+xy$datum_id <- as.numeric(as.factor(xy$datum))
+xy$id <- 1:nrow(xy)
+
+# Sandy razloži kako naredit bazo, tabele in s tem interaktirat
+# https://www.r-bloggers.com/r-and-sqlite-part-1/
+
+# če baze še ni, jo pripravi
+if (!file.exists("naftni_derivati.sqlite")) {
+  nd.db <- dbConnect(SQLite(), dbname = "naftni_derivati.sqlite")
+  dbSendQuery(conn = nd.db, "PRAGMA foreign_keys = 1") # treba vključit foreign key
+  
+  # za datum uporabimo text, ker sqlite nima datumskega podatkovnega tipa
+  # https://www.sqlite.org/datatype3.html
+  dbSendQuery(conn = nd.db, statement = "CREATE TABLE datumi_nd(
+            datum_id INTEGER PRIMARY KEY,
+            datum    TEXT
+            )")
+  
+  dbSendQuery(conn = nd.db, statement = "CREATE TABLE cena_derivatov(
+            id         INTEGER PRIMARY KEY,
+            datum_id   INTEGER,
+            noPb95     REAL,
+            dizl       REAL,
+            kaodizl    REAL,
+            FOREIGN KEY (datum_id) REFERENCES datumi_nd(datum_id) ON DELETE CASCADE ON UPDATE NO ACTION
+)")
+} else {
+  # sicer se pa poveži
+  nd.db <- dbConnect(SQLite(), dbname = "naftni_derivati.sqlite")
+}
+# zapiši podatke v tabelo
+dbWriteTable(con = nd.db, "datumi_nd", value = xy[, c("datum_id", "datum")], overwrite = TRUE)
+dbWriteTable(con = nd.db, "cena_derivatov", value = xy[, c("id", "datum_id", "noPb95", "dizl", "kaodizl")], overwrite = TRUE)
+
+out <- dbGetQuery(conn = nd.db, "SELECT * FROM cena_derivatov NATURAL JOIN datumi_nd")
+dbDisconnect(conn = nd.db)
+
+out <- out[, c("noPb95", "dizl", "kaodizl", "datum")]
+out$datum <- as.Date(out$datum, format = "%d.%m.%Y") # ker sqlite nima datuma, rabiš pretvorit v datum
+
+# pretvorimo podatke v "long" format in izločimo neumne datume
+cd.data <- gather(out, key = derivat, value = cena, -datum)
+cd.data <- cd.data[!(cd.data$datum < as.Date("2007-01-01", "%Y-%m-%d") | cd.data$datum > as.Date(Sys.time())), ]
+```
+
+Inputs {.sidebar}
+-----------------------------------------------------------------------
+
+```{r}
+selectInput("selectProduct", 
+            label = "Derivat",
+            choices = c("95 oktanski" = "noPb95",
+                        "Diesel" = "dizl",
+                        "Kurilno olje" = "kaodizl"),
+            multiple = TRUE,
+            selected = "noPb95"
+)
+```
+
+Ta aplikacija s spletne strani [Ministrstva za zaviranje gospodarstva in tehnologije](http://www.mgrt.gov.si/si/delovna_podrocja/notranji_trg/nadzor_cen_naftnih_derivatov/cene_naftnih_derivatov) pobere podatke o ceni naftnih derivatov. Prikazati je mogoče enega, dva ali vse tri derivate hkrati.
+
+03/2017 Roman Luštrik (romunov@gmail.com)
+
+Column
+-----------------------------------------------------------------------
+### Cena naftnih derivatov v času
+
+```{r}
+plotxy <- reactive({
+  cd.data[cd.data$derivat %in% input$selectProduct, ]
+})
+
+renderPlot({
+  ggplot(plotxy(), aes(x = datum, y = cena, color = derivat)) +
+    theme_bw() +
+    geom_line()
+})
+```
+<!-- deployApp(".", appFiles = c("naftni_derivati_flexboard.Rmd", "naftni_derivati.sqlite"), appName = "cena_naftnih_derivatov") -->
